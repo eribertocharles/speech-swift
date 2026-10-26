@@ -3,6 +3,7 @@ import MLXCommon
 import MLX
 import MLXNN
 import AudioCommon
+import Synchronization
 
 // MARK: - PersonaPlex Model
 
@@ -46,6 +47,15 @@ public final class PersonaPlexModel: Module {
 
     /// Whether the model weights are loaded and ready for inference.
     var _isLoaded = true
+
+    /// Generation loop started by the most recent `respondRealtime` call.
+    private let realtimeTask = Mutex<Task<Void, Never>?>(nil)
+    /// Number of `respondRealtime` generation loops executing. A count rather than a flag, so
+    /// it stays correct even if a caller starts a session before the previous one has exited.
+    private let activeRealtimeLoops = Mutex(0)
+
+    /// Whether a `respondRealtime` generation loop is currently executing.
+    public var isRealtimeLoopRunning: Bool { activeRealtimeLoops.withLock { $0 > 0 } }
 
     public init(cfg: PersonaPlexConfig = .default) {
         self.cfg = cfg
@@ -1028,6 +1038,8 @@ public final class PersonaPlexModel: Module {
                      "contextWindow must be between 1 and \(cfg.temporal.context) steps")
         return AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) { [self] in
+                activeRealtimeLoops.withLock { $0 += 1 }
+                defer { activeRealtimeLoops.withLock { $0 -= 1 } }
                 do {
                     let startTime = CFAbsoluteTimeGetCurrent()
                     // 1920 samples @ 24kHz = one 80ms Mimi frame
@@ -1321,11 +1333,24 @@ public final class PersonaPlexModel: Module {
                     continuation.finish(throwing: error)
                 }
             }
+            realtimeTask.withLock { $0 = task }
             // Cancel the inference task when the stream consumer stops (e.g. user taps stop).
             // Without this, the unstructured Task above outlives the consumer and keeps
             // running, causing multiple concurrent inference tasks on subsequent sessions.
             continuation.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// Stops the generation loop started by `respondRealtime` and returns once it has exited.
+    ///
+    /// Ending the stream (for example by cancelling the task that consumes it) only requests
+    /// cancellation: the loop finishes its current step on its own task, which can take tens
+    /// of milliseconds. The model is not thread-safe, so await this before starting another
+    /// session or using the model in any other way. Returns immediately if no loop is running.
+    public func stopRealtime() async {
+        let task = realtimeTask.withLock { $0 }
+        task?.cancel()
+        await task?.value
     }
 
     // MARK: - Diagnostic Info

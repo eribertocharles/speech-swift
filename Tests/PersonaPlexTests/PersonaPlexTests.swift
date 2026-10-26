@@ -1,5 +1,6 @@
 import XCTest
 import MLX
+import Synchronization
 @testable import PersonaPlex
 import AudioCommon
 import Qwen3ASR
@@ -1038,6 +1039,34 @@ final class E2EPersonaPlexTests: XCTestCase {
             )
             XCTAssertFalse(response.isEmpty, "Voice \(voice.rawValue) should produce audio")
             print("Voice \(voice.rawValue): \(response.count) samples")
+        }
+    }
+
+    // MARK: - Realtime Stop
+
+    /// Ending a realtime stream only requests cancellation; the generation loop finishes its
+    /// current step on its own task. `stopRealtime()` must not return until that loop has
+    /// exited, so a new session never runs concurrently with the old one on the same model.
+    func testStopRealtimeWaitsForGenerationLoop() async throws {
+        if Self._model == nil { try await testLoadModel() }
+        let model = try self.model
+
+        for session in 1...2 {
+            let ring = AudioRingBuffer(capacity: 24_000)
+            let frames = Mutex(0)
+            let consumer = Task {
+                for try await _ in model.respondRealtime(userAudioBuffer: ring) {
+                    frames.withLock { $0 += 1 }
+                }
+            }
+            // Stop mid-stream, while the loop is busy generating.
+            while frames.withLock({ $0 }) < 5 { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertTrue(model.isRealtimeLoopRunning, "session \(session) should be generating")
+
+            await model.stopRealtime()
+            XCTAssertFalse(model.isRealtimeLoopRunning, "stopRealtime() returned while session \(session) was still generating")
+
+            _ = try await consumer.value
         }
     }
 
