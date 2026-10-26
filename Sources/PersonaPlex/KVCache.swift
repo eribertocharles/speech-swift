@@ -123,78 +123,132 @@ public final class KVCachePreAllocated: KVCache {
 
 // MARK: - Ring KV Cache (fixed-size circular buffer for bounded context)
 
+/// Fixed-capacity circular KV cache: once full, each new entry overwrites the oldest.
+///
+/// Mirrors `RingKVCache` in the PyTorch Moshi/PersonaPlex reference: memory and per-step
+/// cost stay constant however long a stream runs, and attention covers at most the last
+/// `capacity` positions. Keys are stored with RoPE already applied at their absolute
+/// positions, so attention is correct regardless of where an entry sits in the ring.
+///
+/// Two ways to use it:
+/// - `update(keys:values:)` writes entries and returns the valid ones in chronological
+///   order (old entries first), for uncompiled and batched-prefill attention.
+/// - Compiled single-step attention reads the full buffers (`keysArray`/`valuesArray`),
+///   writes the new entry at `writeIndex`, masks unwritten slots with `stepMask(dtype:heads:)`,
+///   then hands the updated buffers back via `replaceArrays` and calls `advance()`.
 public final class RingKVCache: KVCache {
     private var keys: MLXArray?
     private var values: MLXArray?
-    private let capacity: Int
-    private var writePos: Int = 0
+    public let capacity: Int
     private var totalWritten: Int = 0
+    private var fullMask: MLXArray?
 
     public init(capacity: Int) {
+        precondition(capacity > 0, "RingKVCache capacity must be positive")
         self.capacity = capacity
     }
 
+    /// Total entries ever written (the stream position), not the number retained.
     public var offset: Int { totalWritten }
     public var keysArray: MLXArray? { keys }
     public var valuesArray: MLXArray? { values }
+
+    /// Number of valid entries currently retained.
+    public var length: Int { min(totalWritten, capacity) }
+
+    /// Ring slot the next entry will be written to.
+    public var writeIndex: Int { totalWritten % capacity }
 
     public func replaceArrays(keys newK: MLXArray, values newV: MLXArray) {
         keys = newK
         values = newV
     }
 
-    /// How many valid entries are in the buffer
-    public var length: Int { min(totalWritten, capacity) }
+    /// Records that one entry was written at `writeIndex` outside `update` (compiled path).
+    public func advance() {
+        totalWritten += 1
+    }
+
+    /// Additive attention mask over the full buffer for a single query whose own entry has
+    /// just been written at `writeIndex`: 0 for written slots, a large negative value for
+    /// slots not yet written. Shape `[1, heads, 1, capacity]`, the exact shape of the
+    /// attention scores: a mask that needs broadcasting would bake the capacity into a
+    /// shapeless-compiled graph, breaking later calls with a different capacity.
+    public func stepMask(dtype: DType, heads: Int) -> MLXArray {
+        let valid = min(totalWritten + 1, capacity)
+        if valid == capacity, let full = fullMask, full.dtype == dtype, full.dim(1) == heads {
+            return full  // every slot is written from here on
+        }
+        var mask = [Float](repeating: -1e9, count: capacity)
+        for i in 0..<valid { mask[i] = 0 }
+        let row = MLXArray(mask).reshaped([1, 1, 1, capacity]).asType(dtype)
+        let result = broadcast(row, to: [1, heads, 1, capacity])
+        eval(result)
+        if valid == capacity { fullMask = result }
+        return result
+    }
 
     public func update(keys newK: MLXArray, values newV: MLXArray) -> (MLXArray, MLXArray) {
         let t = newK.shape[2]
 
         if keys == nil {
-            // First call: allocate buffer
-            let b = newK.shape[0]
-            let h = newK.shape[1]
-            let d = newK.shape[3]
+            let b = newK.shape[0], h = newK.shape[1], d = newK.shape[3]
             keys = MLXArray.zeros([b, h, capacity, d], dtype: newK.dtype)
             values = MLXArray.zeros([b, h, capacity, d], dtype: newV.dtype)
         }
 
-        // Write new entries
-        for i in 0..<t {
-            let pos = (writePos + i) % capacity
-            let kSlice = newK[0..., 0..., i..<(i + 1), 0...]
-            let vSlice = newV[0..., 0..., i..<(i + 1), 0...]
-            // Scatter into buffer position
-            keys![0..., 0..., pos..<(pos + 1), 0...] = kSlice
-            values![0..., 0..., pos..<(pos + 1), 0...] = vSlice
+        // Attention covers the most recent `capacity` positions, the new entries included,
+        // as in the reference (write first, then attend over the ring). Older retained
+        // entries that the new ones displace are left out.
+        let attendK: MLXArray
+        let attendV: MLXArray
+        let keptPast = max(0, capacity - t)
+        if keptPast > 0, let (pastK, pastV) = orderedEntries(last: keptPast) {
+            attendK = concatenated([pastK, newK], axis: 2)
+            attendV = concatenated([pastV, newV], axis: 2)
+        } else {
+            attendK = newK
+            attendV = newV
         }
-        writePos = (writePos + t) % capacity
+
+        // Store the newest `capacity` entries, in at most two contiguous runs per wrap.
+        var source = max(0, t - capacity)
+        var position = (totalWritten + source) % capacity
+        while source < t {
+            let run = min(t - source, capacity - position)
+            keys![0..., 0..., position..<(position + run), 0...] = newK[0..., 0..., source..<(source + run), 0...]
+            values![0..., 0..., position..<(position + run), 0...] = newV[0..., 0..., source..<(source + run), 0...]
+            source += run
+            position = (position + run) % capacity
+        }
         totalWritten += t
 
-        // Return valid portion in order
-        let validLen = min(totalWritten, capacity)
-        if totalWritten <= capacity {
-            let k = keys![0..., 0..., 0..<validLen, 0...]
-            let v = values![0..., 0..., 0..<validLen, 0...]
-            return (k, v)
-        } else {
-            // Circular: reorder so oldest is first
-            let readStart = writePos
-            let part1K = keys![0..., 0..., readStart..<capacity, 0...]
-            let part2K = keys![0..., 0..., 0..<readStart, 0...]
-            let part1V = values![0..., 0..., readStart..<capacity, 0...]
-            let part2V = values![0..., 0..., 0..<readStart, 0...]
-            return (concatenated([part1K, part2K], axis: 2),
-                    concatenated([part1V, part2V], axis: 2))
-        }
+        return (attendK, attendV)
     }
 
-    public func trim(_ count: Int) {
-        if count >= totalWritten {
-            keys = nil
-            values = nil
-            writePos = 0
-            totalWritten = 0
+    /// The newest `last` retained entries (fewer if fewer exist), oldest first; nil when empty.
+    private func orderedEntries(last: Int) -> (MLXArray, MLXArray)? {
+        guard let k = keys, let v = values else { return nil }
+        let count = min(last, length)
+        guard count > 0 else { return nil }
+        // The newest entry sits just before `writeIndex`; walk back `count` slots.
+        let start = (totalWritten - count) % capacity
+        if start + count <= capacity {
+            return (k[0..., 0..., start..<(start + count), 0...], v[0..., 0..., start..<(start + count), 0...])
         }
+        let tail = capacity - start
+        return (
+            concatenated([k[0..., 0..., start..<capacity, 0...], k[0..., 0..., 0..<(count - tail), 0...]], axis: 2),
+            concatenated([v[0..., 0..., start..<capacity, 0...], v[0..., 0..., 0..<(count - tail), 0...]], axis: 2)
+        )
+    }
+
+    /// Only a full reset is supported: entries older than the ring can't be restored.
+    public func trim(_ count: Int) {
+        precondition(count >= totalWritten, "RingKVCache supports only a full reset")
+        keys = nil
+        values = nil
+        totalWritten = 0
     }
 }
 

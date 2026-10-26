@@ -551,6 +551,174 @@ final class KVCacheTests: XCTestCase {
         // Informational: MLX's copy-on-write means pre-alloc doesn't always win.
         // The real optimization is compiled step functions + wired memory pinning.
     }
+
+    // MARK: Ring cache
+
+    /// Keys/values of shape [1, 2, T, 4] whose every element at position t equals `values[t]`.
+    private func positions(_ values: [Float]) -> MLXArray {
+        broadcast(MLXArray(values).reshaped([1, 1, values.count, 1]), to: [1, 2, values.count, 4])
+    }
+
+    /// The per-position values of a [1, H, T, D] array built by `positions`.
+    private func readPositions(_ array: MLXArray) -> [Float] {
+        array[0, 0, 0..., 0].asArray(Float.self)
+    }
+
+    func testRingReturnsHistoryInOrderBeforeWrapping() {
+        let cache = RingKVCache(capacity: 4)
+        for step in 0..<3 {
+            let (k, v) = cache.update(keys: positions([Float(step)]), values: positions([Float(step)]))
+            XCTAssertEqual(readPositions(k), (0...step).map(Float.init))
+            XCTAssertEqual(readPositions(v), (0...step).map(Float.init))
+        }
+        XCTAssertEqual(cache.offset, 3)
+        XCTAssertEqual(cache.length, 3)
+        XCTAssertEqual(cache.writeIndex, 3)
+    }
+
+    func testRingKeepsOnlyTheNewestCapacityPositions() {
+        let cache = RingKVCache(capacity: 4)
+        var last: MLXArray?
+        for step in 0..<7 {
+            (last, _) = cache.update(keys: positions([Float(step)]), values: positions([Float(step)]))
+        }
+        // The newest query attends to exactly `capacity` positions, oldest first.
+        XCTAssertEqual(readPositions(last!), [3, 4, 5, 6])
+        XCTAssertEqual(cache.offset, 7)
+        XCTAssertEqual(cache.length, 4)
+        XCTAssertEqual(cache.writeIndex, 3)
+    }
+
+    func testRingPrefillLongerThanCapacity() {
+        let cache = RingKVCache(capacity: 4)
+        // A batch attends to all of its own entries; only the newest 4 are retained.
+        let (k, _) = cache.update(keys: positions([0, 1, 2, 3, 4, 5]), values: positions([0, 1, 2, 3, 4, 5]))
+        XCTAssertEqual(readPositions(k), [0, 1, 2, 3, 4, 5])
+        XCTAssertEqual(cache.length, 4)
+
+        let (next, _) = cache.update(keys: positions([6]), values: positions([6]))
+        XCTAssertEqual(readPositions(next), [3, 4, 5, 6])
+    }
+
+    func testRingStepMaskCoversWrittenSlotsOnly() {
+        let cache = RingKVCache(capacity: 4)
+        _ = cache.update(keys: positions([0, 1]), values: positions([0, 1]))
+
+        // The next step writes slot 2, so slots 0...2 are valid and slot 3 is masked.
+        let mask = cache.stepMask(dtype: .float32, heads: 3)
+        XCTAssertEqual(mask.shape, [1, 3, 1, 4])
+        XCTAssertEqual(mask[0, 2, 0, 0...].asArray(Float.self), [0, 0, 0, -1e9])
+
+        cache.advance()
+        cache.advance()
+        XCTAssertEqual(cache.stepMask(dtype: .float32, heads: 3)[0, 0, 0, 0...].asArray(Float.self), [0, 0, 0, 0])
+    }
+
+    func testRingCompiledStyleWritesWrapAround() {
+        let cache = RingKVCache(capacity: 3)
+        _ = cache.update(keys: positions([0]), values: positions([0]))
+        var indices: [Int] = []
+        for _ in 0..<5 {
+            indices.append(cache.writeIndex)
+            // A compiled step writes into the full buffers, then hands them back.
+            cache.replaceArrays(keys: cache.keysArray!, values: cache.valuesArray!)
+            cache.advance()
+        }
+        XCTAssertEqual(indices, [1, 2, 0, 1, 2])
+        XCTAssertEqual(cache.offset, 6)
+        XCTAssertEqual(cache.length, 3)
+        XCTAssertEqual(cache.keysArray!.shape, [1, 2, 3, 4])
+    }
+
+    func testRingTrimResets() {
+        let cache = RingKVCache(capacity: 4)
+        _ = cache.update(keys: positions([0, 1, 2]), values: positions([0, 1, 2]))
+        cache.trim(cache.offset)
+        XCTAssertEqual(cache.offset, 0)
+        XCTAssertEqual(cache.length, 0)
+        XCTAssertNil(cache.keysArray)
+    }
+}
+
+// MARK: - Temporal transformer ring cache (regression: unbounded KV growth)
+
+/// Runs a tiny, randomly initialized temporal transformer, so no weights are needed.
+final class TemporalRingCacheTests: XCTestCase {
+
+    private let cfg = TemporalTransformerConfig(
+        dim: 64, numLayers: 2, numHeads: 4, nQ: 2, card: 16, textCard: 32, context: 16, bits: 16)
+
+    /// Deterministic [1, T, dim] input that differs per position.
+    private func input(_ start: Int, count: Int = 1) -> MLXArray {
+        let values = (0..<(count * cfg.dim)).map { sin(Float(start * cfg.dim + $0) * 0.37) }
+        return MLXArray(values).reshaped([1, count, cfg.dim])
+    }
+
+    /// Before the fix, compiled steps concatenated onto the cache, so it grew by one entry
+    /// per step without bound and per-step cost grew with stream length.
+    func testCompiledStepsKeepCacheAtCapacity() {
+        let temporal = TemporalTransformer(cfg: cfg)
+        temporal.setupCompilation()
+        temporal.resetCache(capacity: 8)
+        temporal.forwardBatchEmbedding(input(0, count: 3), offset: 0)
+
+        for step in 3..<23 {
+            let (hidden, logits) = temporal.executeStep(hidden: input(step), offset: step)
+            eval(hidden, logits)
+        }
+
+        XCTAssertEqual(temporal.cacheCapacity, 8)
+        for cache in temporal.cache {
+            XCTAssertEqual(cache.keysArray?.shape[2], 8)
+            XCTAssertEqual(cache.valuesArray?.shape[2], 8)
+            XCTAssertEqual(cache.offset, 23)
+        }
+    }
+
+    /// The compiled ring step (scatter + masked attention over the whole buffer) must match
+    /// uncompiled attention over the same window, including after the ring wraps.
+    func testCompiledStepMatchesUncompiledAcrossWraps() {
+        let temporal = TemporalTransformer(cfg: cfg)
+        temporal.setupCompilation()
+        let capacity = 6
+        temporal.resetCache(capacity: capacity)
+        let reference = (0..<cfg.numLayers).map { _ in RingKVCache(capacity: capacity) }
+
+        func referenceStep(_ x: MLXArray, offset: Int) -> (MLXArray, MLXArray) {
+            var h = x
+            for (layer, cache) in zip(temporal.layers, reference) { h = layer(h, cache: cache, offset: offset) }
+            let normed = temporal.out_norm(h)
+            return (normed, temporal.text_linear(normed))
+        }
+
+        temporal.forwardBatchEmbedding(input(0, count: 4), offset: 0)
+        _ = referenceStep(input(0, count: 4), offset: 0)
+
+        for step in 4..<20 {  // wraps the 6-slot ring more than twice
+            let (hidden, logits) = temporal.executeStep(hidden: input(step), offset: step)
+            let (refHidden, refLogits) = referenceStep(input(step), offset: step)
+            let hiddenDiff = abs(hidden - refHidden).max().item(Float.self)
+            let logitDiff = abs(logits - refLogits).max().item(Float.self)
+            XCTAssertLessThan(hiddenDiff, 1e-4, "hidden mismatch at step \(step)")
+            XCTAssertLessThan(logitDiff, 1e-4, "logit mismatch at step \(step)")
+        }
+    }
+
+    /// The compiled step is traced once (shapeless); later calls with a different capacity
+    /// must still work.
+    func testCompiledStepWorksAcrossCapacities() {
+        let temporal = TemporalTransformer(cfg: cfg)
+        temporal.setupCompilation()
+        for capacity in [12, 5, 9] {
+            temporal.resetCache(capacity: capacity)
+            temporal.forwardBatchEmbedding(input(0, count: 2), offset: 0)
+            for step in 2..<(capacity + 4) {
+                let (hidden, logits) = temporal.executeStep(hidden: input(step), offset: step)
+                eval(hidden, logits)
+            }
+            XCTAssertEqual(temporal.cache.first?.keysArray?.shape[2], capacity)
+        }
+    }
 }
 
 // MARK: - E2E Tests (require model download)

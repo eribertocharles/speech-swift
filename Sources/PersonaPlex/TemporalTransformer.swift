@@ -114,6 +114,35 @@ public final class TemporalAttention: Module {
             mask: MLXFast.ScaledDotProductAttentionMaskMode.none)
         return (applyLinear(out_proj, merged), newK, newV)
     }
+
+    /// Compile-compatible forward over a fixed-capacity ring cache (see `RingKVCache`).
+    /// For T=1 autoregressive steps. Writes the new key/value at `writeIndex` and attends
+    /// over the whole buffer, with `mask` excluding slots that haven't been written yet.
+    /// Buffer shapes stay constant, so per-step cost doesn't grow with stream length.
+    /// Returns (output, newK, newV) where newK/newV are the updated full buffers.
+    public func forwardStep(
+        _ xs: MLXArray, offset: MLXArray, writeIndex: MLXArray, mask: MLXArray,
+        cacheK: MLXArray, cacheV: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let qkv = applyLinear(in_proj, xs)
+        let qkvR = qkv.reshaped([-1, 1, 3, cfg.numHeads, cfg.headDim])
+        var q = qkvR.take(MLXArray(Int32(0)), axis: 2).transposed(0, 2, 1, 3) // [B,H,1,D]
+        var k = qkvR.take(MLXArray(Int32(1)), axis: 2).transposed(0, 2, 1, 3)
+        let v = qkvR.take(MLXArray(Int32(2)), axis: 2).transposed(0, 2, 1, 3)
+
+        q = rope(q, offset: offset)
+        k = rope(k, offset: offset)
+
+        // Scatter the new entry into its ring slot: indices [1,1,1,1] broadcast over B, H, D.
+        let slot = writeIndex.reshaped([1, 1, 1, 1])
+        let newK = putAlong(cacheK, slot, values: k, axis: 2)
+        let newV = putAlong(cacheV, slot, values: v, axis: 2)
+
+        let merged = SDPA.attendAndMerge(
+            qHeads: q, kHeads: newK, vHeads: newV, scale: scale,
+            mask: MLXFast.ScaledDotProductAttentionMaskMode.array(mask))
+        return (applyLinear(out_proj, merged), newK, newV)
+    }
 }
 
 // MARK: - Temporal FFN (SiLU-gated / SwiGLU)
@@ -178,6 +207,19 @@ public final class TemporalTransformerLayer: Module {
         x = x + gating(norm2(x))
         return (x, newK, newV)
     }
+
+    /// Compile-compatible forward over a fixed-capacity ring cache.
+    public func forwardStep(
+        _ xs: MLXArray, offset: MLXArray, writeIndex: MLXArray, mask: MLXArray,
+        cacheK: MLXArray, cacheV: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let (attnOut, newK, newV) = self_attn.forwardStep(
+            norm1(xs), offset: offset, writeIndex: writeIndex, mask: mask,
+            cacheK: cacheK, cacheV: cacheV)
+        var x = xs + attnOut
+        x = x + gating(norm2(x))
+        return (x, newK, newV)
+    }
 }
 
 // MARK: - Temporal Transformer
@@ -195,10 +237,16 @@ public final class TemporalTransformer: Module {
     // Output heads
     @ModuleInfo public var text_linear: Linear     // text logit head
 
-    public private(set) var cache: [any KVCache]
+    /// Per-layer KV caches: fixed-capacity rings, so memory and per-step cost stay bounded.
+    private var ringCaches: [RingKVCache]
+
+    public var cache: [any KVCache] { ringCaches }
+
+    /// Attention window of the current caches, in steps (12.5 Hz).
+    public var cacheCapacity: Int { ringCaches.first?.capacity ?? cfg.context }
 
     /// Compiled temporal step function for Metal kernel fusion.
-    /// Input: [hidden, offset, K0, V0, K1, V1, ..., K31, V31]
+    /// Input: [hidden, offset, writeIndex, mask, K0, V0, K1, V1, ..., K31, V31]
     /// Output: [normed, textLogits, K0, V0, ..., K31, V31]
     public private(set) var compiledStep: (([MLXArray]) -> [MLXArray])?
 
@@ -222,11 +270,20 @@ public final class TemporalTransformer: Module {
         // Text output head (textCard outputs, no +1 — special token only in embedding)
         self._text_linear = ModuleInfo(wrappedValue: Linear(cfg.dim, cfg.textCard, bias: false))
 
-        self.cache = (0..<cfg.numLayers).map { _ in KVCacheSimple() }
+        self.ringCaches = Self.makeCaches(count: cfg.numLayers, capacity: cfg.context)
     }
 
-    public func resetCache() {
-        for c in cache { c.trim(c.offset) }
+    /// Clears all KV caches.
+    /// - Parameter capacity: attention window in steps (12.5 Hz). Defaults to the model's
+    ///   trained context (`cfg.context`, 3000 steps = 4 min). A smaller window keeps
+    ///   per-step cost lower on slower hardware; history older than the window is dropped,
+    ///   as in the reference implementation's ring cache.
+    public func resetCache(capacity: Int? = nil) {
+        ringCaches = Self.makeCaches(count: cfg.numLayers, capacity: capacity ?? cfg.context)
+    }
+
+    private static func makeCaches(count: Int, capacity: Int) -> [RingKVCache] {
+        (0..<count).map { _ in RingKVCache(capacity: capacity) }
     }
 
     /// Forward pass with pre-computed embedding (for voice prompt replay, single step).
@@ -303,15 +360,18 @@ public final class TemporalTransformer: Module {
             inputs: [selfRef], outputs: [selfRef], shapeless: true
         ) { inputs in
             var hidden = inputs[0]           // [B, 1, dim] — pre-computed embedding sum
-            let offset = inputs[1]           // MLXArray scalar
+            let offset = inputs[1]           // MLXArray scalar: RoPE position
+            let writeIndex = inputs[2]       // MLXArray scalar: ring slot for this step
+            let mask = inputs[3]             // [1, heads, 1, capacity] additive mask
 
-            // Pass through all layers with explicit cache
+            // Pass through all layers with explicit ring-cache buffers
             var outCache: [MLXArray] = []
             for i in 0..<numLayers {
-                let cK = inputs[2 + i * 2]
-                let cV = inputs[3 + i * 2]
+                let cK = inputs[4 + i * 2]
+                let cV = inputs[5 + i * 2]
                 let (h, newK, newV) = selfRef.layers[i].forwardStep(
-                    hidden, offset: offset, cacheK: cK, cacheV: cV)
+                    hidden, offset: offset, writeIndex: writeIndex, mask: mask,
+                    cacheK: cK, cacheV: cV)
                 hidden = h
                 outCache.append(newK)
                 outCache.append(newV)
@@ -344,9 +404,21 @@ public final class TemporalTransformer: Module {
             return (normed, textLogits)
         }
 
-        // Build flat input array: [hidden, offset, K0, V0, ..., K31, V31]
+        // Build flat input array: [hidden, offset, writeIndex, mask, K0, V0, ..., K31, V31].
+        // All layers share one stream position, so the first ring describes them all.
+        guard let ring = ringCaches.first, let firstKeys = ring.keysArray else {
+            var h = hidden
+            for (layer, c) in zip(layers, cache) {
+                h = layer(h, cache: c, offset: offset)
+            }
+            let normed = out_norm(h)
+            let textLogits = text_linear(normed)
+            return (normed, textLogits)
+        }
         let offsetArr = MLXArray(Int32(offset))
-        var flatInputs: [MLXArray] = [hidden, offsetArr]
+        let writeIndexArr = MLXArray(Int32(ring.writeIndex))
+        let mask = ring.stepMask(dtype: firstKeys.dtype, heads: cfg.numHeads)
+        var flatInputs: [MLXArray] = [hidden, offsetArr, writeIndexArr, mask]
         for c in cache {
             if let k = c.keysArray, let v = c.valuesArray {
                 flatInputs.append(k)
@@ -365,9 +437,10 @@ public final class TemporalTransformer: Module {
 
         let out = compiled(flatInputs)
 
-        // Update KVCache objects from compiled output
+        // Hand the updated ring buffers back and record the written slot.
         for i in 0..<cfg.numLayers {
-            cache[i].replaceArrays(keys: out[2 + i * 2], values: out[3 + i * 2])
+            ringCaches[i].replaceArrays(keys: out[2 + i * 2], values: out[3 + i * 2])
+            ringCaches[i].advance()
         }
 
         return (out[0], out[1])
