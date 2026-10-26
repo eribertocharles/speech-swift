@@ -61,6 +61,24 @@ final class AudioRingBufferTests: XCTestCase {
         XCTAssertEqual(result, [5, 6, 7, 8])
     }
 
+    func testDroppedSampleCountTracksOverwrites() {
+        let buf = AudioRingBuffer(capacity: 4)
+        buf.write([1, 2, 3, 4])
+        XCTAssertEqual(buf.droppedSampleCount, 0)
+
+        buf.write([5])
+        XCTAssertEqual(buf.droppedSampleCount, 1)
+
+        let block: [Float] = [6, 7, 8, 9, 10, 11]
+        block.withUnsafeBufferPointer { buf.write(from: $0.baseAddress!, count: $0.count) }
+        XCTAssertEqual(buf.droppedSampleCount, 7)
+
+        // Reading never counts as dropping.
+        _ = buf.read(4)
+        _ = buf.read(4)
+        XCTAssertEqual(buf.droppedSampleCount, 7)
+    }
+
     // MARK: Wrap-around
 
     func testWriteAndReadAcrossBufferBoundary() {

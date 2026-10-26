@@ -11,6 +11,7 @@ public final class AudioRingBuffer: @unchecked Sendable {
     private var readPos = 0
     private var writePos = 0
     private var count = 0
+    private var dropped = 0
     private var _lock = os_unfair_lock()
     private let capacity: Int
 
@@ -28,6 +29,7 @@ public final class AudioRingBuffer: @unchecked Sendable {
                 // Drop oldest sample
                 readPos = (readPos + 1) % capacity
                 count -= 1
+                dropped += 1
             }
             buffer[writePos] = sample
             writePos = (writePos + 1) % capacity
@@ -44,6 +46,7 @@ public final class AudioRingBuffer: @unchecked Sendable {
             if count == capacity {
                 readPos = (readPos + 1) % capacity
                 count -= 1
+                dropped += 1
             }
             buffer[writePos] = pointer[i]
             writePos = (writePos + 1) % capacity
@@ -64,6 +67,14 @@ public final class AudioRingBuffer: @unchecked Sendable {
         count -= available
         // Remaining positions stay as zero (underrun padding)
         return result
+    }
+
+    /// Total samples discarded because the buffer was full when they were overwritten,
+    /// i.e. audio the reader fell too far behind to ever see.
+    public var droppedSampleCount: Int {
+        os_unfair_lock_lock(&_lock)
+        defer { os_unfair_lock_unlock(&_lock) }
+        return dropped
     }
 
     /// Number of samples currently available to read.
