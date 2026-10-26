@@ -176,8 +176,7 @@ public final class PersonaPlexModel: Module {
             print("  Voice prompt: \(voiceFrameCount) frames, text prompt: \(textPromptLen) tokens (\(String(format: "%.2f", voiceTime))s)")
         }
 
-        // 3. Reset caches
-        temporal.resetCache()
+        // 3. Reset caches (temporal cache is sized below, once the total length is known)
         mimi.resetState()
 
         // Total steps: voice + silence1 + text_prompt + silence2 + user audio + gen
@@ -191,6 +190,7 @@ public final class PersonaPlexModel: Module {
         let numStreams = cfg.numStreams
         let nQ = cfg.temporal.nQ
         let totalLen = prefillLen + maxSteps + maxDelay + 3
+        temporal.resetCache(capacity: min(cfg.temporal.context, totalLen))
 
         // 4. Initialize token cache
         // Stream 0 = text, streams 1-8 = agent audio, streams 9-16 = user audio
@@ -667,7 +667,7 @@ public final class PersonaPlexModel: Module {
                     let totalLen = prefillLen + maxSteps + maxDelay + 3
 
                     // 3. Reset caches + initialize streaming decoder
-                    temporal.resetCache()
+                    temporal.resetCache(capacity: min(cfg.temporal.context, totalLen))
                     mimi.resetState()
                     let streamingDecoder = MimiStreamingDecoder(mimi)
 
@@ -1007,6 +1007,12 @@ public final class PersonaPlexModel: Module {
     ///   - systemPromptTokens: SentencePiece-tokenized system prompt (nil = default)
     ///   - userAudioBuffer: ring buffer continuously written by the audio capture thread
     ///   - maxSteps: maximum generation steps (Int.max = run until Task is cancelled)
+    ///   - contextWindow: attention window in steps (12.5 Hz), from 1 up to the model's
+    ///     trained context (`cfg.temporal.context`, 3000 = 4 min), which is the default.
+    ///     Per-step cost grows with the window until it fills, then stays constant; a
+    ///     smaller window keeps slower Macs within the 80 ms real-time budget. Anything
+    ///     older than the window, including the voice and system prompt, is dropped, as in
+    ///     the reference implementation.
     ///   - verbose: print per-step timing every 50 steps
     /// - Returns: AsyncThrowingStream yielding one `[Float]` audio frame (~1920 samples) per step
     public func respondRealtime(
@@ -1014,9 +1020,13 @@ public final class PersonaPlexModel: Module {
         systemPromptTokens: [Int32]? = nil,
         userAudioBuffer: AudioRingBuffer,
         maxSteps: Int = Int.max,
+        contextWindow: Int? = nil,
         verbose: Bool = false
     ) -> AsyncThrowingStream<[Float], Error> {
-        AsyncThrowingStream { continuation in
+        let window = contextWindow ?? cfg.temporal.context
+        precondition((1...cfg.temporal.context).contains(window),
+                     "contextWindow must be between 1 and \(cfg.temporal.context) steps")
+        return AsyncThrowingStream { continuation in
             let task = Task.detached(priority: .userInitiated) { [self] in
                 do {
                     let startTime = CFAbsoluteTimeGetCurrent()
@@ -1063,7 +1073,7 @@ public final class PersonaPlexModel: Module {
                     let totalLen = prefillLen + loopSteps + maxDelay + 3
 
                     // 2. Reset model state and initialize streaming decoder
-                    temporal.resetCache()
+                    temporal.resetCache(capacity: min(window, totalLen))
                     mimi.resetState()
                     let streamingDecoder = MimiStreamingDecoder(mimi)
 
@@ -1363,7 +1373,6 @@ public final class PersonaPlexModel: Module {
         let textPromptTokens = systemPromptTokens ?? TemporalTransformerConfig.defaultSystemPromptTokens
         let textPromptLen = textPromptTokens.count
 
-        temporal.resetCache()
         mimi.resetState()
 
         let promptLen = voiceFrameCount + silenceFrameCount + textPromptLen + silenceFrameCount
@@ -1372,6 +1381,7 @@ public final class PersonaPlexModel: Module {
         let numStreams = cfg.numStreams
         let nQ = cfg.temporal.nQ
         let totalLen = prefillLen + maxSteps + cfg.maxDelay + 3
+        temporal.resetCache(capacity: min(cfg.temporal.context, totalLen))
 
         var tokenCache = [[Int32]](repeating: [Int32](repeating: -1, count: totalLen), count: numStreams)
 
@@ -1683,8 +1693,9 @@ public final class PersonaPlexModel: Module {
     public func warmUp() {
         setupCompilation()
 
-        // Run a single compiled step to trace the graph
-        temporal.resetCache()
+        // Run a single compiled step to trace the graph. The compiled function is
+        // shapeless, so a small cache traces the same graph without a full allocation.
+        temporal.resetCache(capacity: 8)
 
         // First, do a prefill to initialize KV caches (compiled step needs non-empty cache)
         let dummyText = MLXArray([Int32(3)]).reshaped([1, 1])
